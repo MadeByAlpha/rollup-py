@@ -229,13 +229,7 @@ def plan_vendoring(
         if config.vendor is None or dep.name in config.vendor:
             queue.append((None, frozenset(), dep))
 
-    while queue:
-        parent, parent_extras, dep = queue.popleft()
-        if not _should_vendor(dep, config, environment, direct=parent is None):
-            if parent is not None and _applies(dep, config, environment):
-                plan.hoisted.append(Hoisted(parent, dep, parent_extras))
-            continue
-
+    def vendor(dep: Dependency) -> None:
         package = lock.resolve(dep)
         known = plan.vendored.get(package.key)
         requested = set(dep.extras)
@@ -249,6 +243,23 @@ def plan_vendoring(
         all_extras = frozenset(plan.vendored[package.key][1])
         for extra in sorted(new_extras):
             queue.extend((package, all_extras, edge) for edge in package.optional_dependencies.get(extra, ()))
+
+    while queue:
+        parent, parent_extras, dep = queue.popleft()
+        if _should_vendor(dep, config, environment, direct=parent is None):
+            vendor(dep)
+        elif parent is not None and _applies(dep, config, environment):
+            plan.hoisted.append(Hoisted(parent, dep, parent_extras))
+
+        if not queue:
+            # A hoisted edge to a package that another path vendors is served by the vendored copy, so
+            # it is no requirement of the bundle. The copy still has to carry the extras the edge asks
+            # for (possibly queueing more edges), and a different locked version is a clash.
+            vendored = plan.vendored_names
+            for item in plan.hoisted:
+                if item.dependency.name in vendored:
+                    vendor(item.dependency)
+            plan.hoisted = [item for item in plan.hoisted if item.dependency.name not in vendored]
 
     _check_version_clashes(plan)
     _check_external_overlap(lock, plan, config, environment)
@@ -299,20 +310,18 @@ def _check_external_overlap(
     """
     vendored = plan.vendored_names
     starts: list[tuple[Dependency, str]] = [
-        (dep, f"{plan.project.name} -> {dep.name}")
-        for dep in plan.project.dependencies
-        if dep.name not in vendored
+        (dep, f"{plan.project.name} -> {dep.name}") for dep in plan.project.dependencies
     ]
     starts.extend(
         (dep, f"{plan.project.name}[{extra}] -> {dep.name}")
         for extra, deps in plan.project.optional_dependencies.items()
         for dep in deps
-        if dep.name not in vendored
     )
     starts.extend((item.dependency, f"{item.parent.name} -> {item.dependency.name}") for item in plan.hoisted)
 
     visited: set[tuple[str, str | None, tuple[tuple[str, str], ...], frozenset[str]]] = set()
-    queue = deque(starts)
+    # Only packages the installer brings in are walked; a vendored one is part of the bundle itself.
+    queue = deque((dep, path) for dep, path in starts if dep.name not in vendored)
     while queue:
         dep, path = queue.popleft()
         if (

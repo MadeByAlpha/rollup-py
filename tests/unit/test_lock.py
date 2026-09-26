@@ -5,7 +5,14 @@ from packaging.utils import canonicalize_name
 
 from rollup_py.config import RollupConfig
 from rollup_py.errors import RollupError
-from rollup_py.lock import Dependency, Hoisted, Lockfile, find_lockfile, plan_vendoring
+from rollup_py.lock import (
+    Dependency,
+    Hoisted,
+    Lockfile,
+    _check_external_overlap,
+    find_lockfile,
+    plan_vendoring,
+)
 from rollup_py.markers import target_environment
 
 LINUX = target_environment("3.12", "x86_64-unknown-linux-gnu")
@@ -165,6 +172,54 @@ def test_external_package_depending_on_vendored_one_is_rejected(lock: Lockfile) 
     lock.path.write_text(text)
     with pytest.raises(RollupError, match=r"`six` is vendored but is also required.*app -> requests -> six"):
         plan_vendoring(Lockfile.load(lock.path), "app", config(external=["requests"]), LINUX)
+
+
+def with_edge(lock: Lockfile, edge: str, text: str = LOCK) -> Lockfile:
+    """`lock` rewritten so that `markupsafe` has the single dependency `edge`."""
+    anchor = 'name = "markupsafe"\nversion = "3.0.0"\nsource = { registry = "https://pypi.org/simple" }\n'
+    lock.path.write_text(text.replace(anchor, f"{anchor}dependencies = [{edge}]\n"))
+    return Lockfile.load(lock.path)
+
+
+def test_conditional_edge_to_vendored_package_is_not_hoisted(lock: Lockfile) -> None:
+    # `requests` is vendored through `app`; the conditional `markupsafe -> requests` is served by that
+    # copy, so it neither becomes a requirement nor makes `idna` look required by an external package.
+    lock = with_edge(lock, """{ name = "requests", marker = "sys_platform != 'emscripten'" }""")
+    plan = plan_vendoring(lock, "app", config(external=["certifi"]), LINUX)
+    assert "requests" in plan.vendored_names
+    assert hoisted(plan.hoisted) == {("requests", "certifi"), ("lib", "colorama")}
+
+
+def test_conditional_edge_to_vendored_package_carries_its_extras(lock: Lockfile) -> None:
+    text = LOCK.replace('{ name = "requests", extra = ["socks"] }', '{ name = "requests" }')
+    lock = with_edge(
+        lock, """{ name = "requests", extra = ["socks"], marker = "sys_platform != 'emscripten'" }""", text
+    )
+    plan = plan_vendoring(lock, "app", config(external=["certifi"]), LINUX)
+    requests = next(extras for package, extras in plan.vendored.values() if package.name == "requests")
+    assert requests == {"socks"}
+    assert "pysocks" in plan.vendored_names
+    assert ("markupsafe", "requests") not in hoisted(plan.hoisted)
+
+
+def test_conditional_edge_to_other_version_of_vendored_package_clashes(lock: Lockfile) -> None:
+    text = LOCK.replace('    { name = "six" },\n]', '    { name = "six", version = "1.16.0" },\n]') + (
+        '\n[[package]]\nname = "six"\nversion = "1.17.0"\nsource = { registry = "https://pypi.org/simple" }\n'
+    )
+    lock = with_edge(
+        lock, """{ name = "six", version = "1.17.0", marker = "sys_platform == 'win32'" }""", text
+    )
+    with pytest.raises(RollupError, match=r"Two versions of `six`"):
+        plan_vendoring(lock, "app", config(), LINUX)
+
+
+def test_overlap_check_skips_vendored_starts(lock: Lockfile) -> None:
+    # A hoisted edge naming a vendored package is not an external package, even if one slips through.
+    plan = plan_vendoring(lock, "app", config(external=["certifi"]), LINUX)
+    requests = next(package for package in plan.packages if package.name == "requests")
+    markupsafe = next(package for package in plan.packages if package.name == "markupsafe")
+    plan.hoisted.append(Hoisted(markupsafe, Dependency(name=requests.name), frozenset()))
+    _check_external_overlap(lock, plan, config(external=["certifi"]), LINUX)
 
 
 def test_forked_versions_resolve_by_version(tmp_path: Path) -> None:
