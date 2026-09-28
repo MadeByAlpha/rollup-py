@@ -52,17 +52,45 @@ inherited and can be overridden there.
 | `distribution-name` | `"{name}-rollup"` | Name of the bundled distribution. Must differ from the project name. |
 | `vendor` | `["*"]` | Direct dependencies to bundle; `"*"` means all of them. |
 | `external` | `[]` | Packages never bundled. They become `Requires-Dist` entries of the bundle. |
+| `extras`, `groups` | `[]` | Extras (`[project.optional-dependencies]`) and dependency groups (`[dependency-groups]`) of the project whose dependencies are bundled like `dependencies`, as `uv sync --extra`/`--group` would install them. Those that are not bundled become unconditional requirements. |
 | `transitive` | `true` | Also bundle the dependencies of bundled packages. When `false` they become requirements. |
 | `conditional` | `"external"` | Dependencies behind an environment marker: `"external"` keeps them as requirements with their marker; `"evaluate"` evaluates the marker for the target environment and bundles or drops them. |
 | `lock` | `"auto"` | Path to `uv.lock`; `"auto"` searches upwards from the project. |
 | `check-lock` | `true` | Run `uv lock --check` first and fail on a stale lock. |
 | `python-version`, `python-platform` | | Same as the CLI flags (the flags win). |
 
+### Different dependencies for development and the bundle
+
+`extras` and `groups` pick a set of dependencies that `uv sync` leaves out, e.g. a patched fork that
+only the bundle should ship, while development uses the original:
+
+```toml
+[project.optional-dependencies]
+patched = ["six"]
+
+[dependency-groups]
+dev = ["six"]
+
+[tool.uv]
+conflicts = [[{ extra = "patched" }, { group = "dev" }]]
+
+[tool.uv.sources]
+six = [{ git = "https://github.com/me/six", branch = "fix", extra = "patched" }]
+
+[tool.hatch.build.targets.rollup]
+extras = ["patched"]
+```
+
+With `[tool.uv] conflicts`, `uv.lock` holds both versions and marks the edges of other packages
+with the extra or group they belong to (`extra == 'extra-3-app-patched'`). The bundle follows the
+selected ones, so a package that depends on `six` gets the fork too. Selecting two conflicting items
+is an error.
+
 ## How it works
 
-1. `uv.lock` is read to find the project, walk its dependency graph and split it into bundled and
-   external packages. A walk stops at every external package, since the installer handles its
-   dependencies.
+1. `uv.lock` is read to find the project, walk its dependency graph (from `dependencies` plus the
+   selected `extras` and `groups`) and split it into bundled and external packages. A walk stops at
+   every external package, since the installer handles its dependencies.
 2. Each bundled package is installed at its locked version with
    `uv pip install --target <tmp> --no-deps`: registry and URL packages with `--require-hashes` and
    every hash from the lock, git packages at their locked commit, workspace members from their
@@ -91,6 +119,8 @@ because installing both would put two copies of the same files in `site-packages
 - `uv build` cannot build this target: hatchling's PEP 517 entry points only build `sdist` and
   `wheel`. Use `rollup-py build` or `hatch build -t rollup`.
 - Nothing is tree-shaken; packages are bundled whole.
+- Only the project's own `extras` and `groups` count for `[tool.uv] conflicts`; conflicting extras
+  of other packages are resolved as if none were enabled.
 
 ## Development
 

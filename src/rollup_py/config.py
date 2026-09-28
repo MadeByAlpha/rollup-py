@@ -27,6 +27,9 @@ class RollupConfig:
     # `None` means every direct dependency (`vendor = ["*"]`).
     vendor: frozenset[NormalizedName] | None
     external: frozenset[NormalizedName]
+    # Extras and dependency groups of the project whose dependencies are bundled like `dependencies`.
+    extras: frozenset[NormalizedName]
+    groups: frozenset[NormalizedName]
     transitive: bool
     conditional: Conditional
     # `None` means "search upwards from the project root".
@@ -54,9 +57,7 @@ class RollupConfig:
         else:
             vendor = frozenset(canonicalize_name(name) for name in raw_vendor)
 
-        external = frozenset(
-            canonicalize_name(name) for name in _get_str_list(config, "external", default=[])
-        )
+        external = _get_name_set(config, "external")
         if vendor is not None and (overlap := vendor & external):
             raise RollupError(
                 f"`{TABLE}`: packages listed in both `vendor` and `external`: {', '.join(sorted(overlap))}"
@@ -72,6 +73,8 @@ class RollupConfig:
             distribution_name=distribution_name,
             vendor=vendor,
             external=external,
+            extras=_get_name_set(config, "extras"),
+            groups=_get_name_set(config, "groups"),
             transitive=_get_bool(config, "transitive", default=True),
             conditional=conditional,
             lock=None if lock == "auto" else lock,
@@ -102,3 +105,7 @@ def _get_str_list(config: Mapping[str, Any], key: str, *, default: list[str]) ->
     if not isinstance(value, list) or not all(isinstance(item, str) for item in cast("list[Any]", value)):
         raise RollupError(f"`{TABLE}.{key}` must be an array of strings")
     return cast("list[str]", value)
+
+
+def _get_name_set(config: Mapping[str, Any], key: str) -> frozenset[NormalizedName]:
+    return frozenset(canonicalize_name(name) for name in _get_str_list(config, key, default=[]))

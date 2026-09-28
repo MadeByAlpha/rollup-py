@@ -9,6 +9,8 @@ def test_defaults() -> None:
     assert config.distribution_name == "app-rollup"
     assert config.vendor is None
     assert config.external == frozenset()
+    assert config.extras == frozenset()
+    assert config.groups == frozenset()
     assert config.transitive
     assert config.conditional == "external"
     assert config.lock is None
@@ -17,10 +19,19 @@ def test_defaults() -> None:
 
 def test_names_are_normalized() -> None:
     config = RollupConfig.from_target_config(
-        {"vendor": ["Requests", "zope.interface"], "external": ["Typing_Extensions"]}, "app", environ={}
+        {
+            "vendor": ["Requests", "zope.interface"],
+            "external": ["Typing_Extensions"],
+            "extras": ["Prod_Patched"],
+            "groups": ["Dev.Original"],
+        },
+        "app",
+        environ={},
     )
     assert config.vendor == {"requests", "zope-interface"}
     assert config.external == {"typing-extensions"}
+    assert config.extras == {"prod-patched"}
+    assert config.groups == {"dev-original"}
 
 
 def test_environment_overrides_config() -> None:
@@ -39,6 +50,7 @@ def test_environment_overrides_config() -> None:
         ({"conditional": "always"}, "must be"),
         ({"transitive": "yes"}, "must be a boolean"),
         ({"external": "certifi"}, "must be an array of strings"),
+        ({"groups": "prod"}, "must be an array of strings"),
     ],
 )
 def test_invalid(options: dict[str, object], message: str) -> None:

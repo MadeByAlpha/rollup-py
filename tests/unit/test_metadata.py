@@ -91,3 +91,11 @@ def test_hoisted_requirements_are_deduplicated() -> None:
         Hoisted(other, Dependency(name=canonicalize_name("six")), frozenset()),
     ]
     assert hoisted_requirements(items, {}) == ["six>=1.16"]
+
+
+def test_hoisted_requirements_of_selected_groups() -> None:
+    app = package("app", ["requests", "six; extra == 'prod'"])
+    app.requires_dev = {"dev": [Requirement("six==1.17.0")]}
+    six = Dependency(name=canonicalize_name("six"))
+    assert hoisted_requirements([Hoisted(app, six, frozenset({"prod"}))], {}) == ["six"]
+    assert hoisted_requirements([Hoisted(app, six, frozenset(), frozenset({"dev"}))], {}) == ["six==1.17.0"]

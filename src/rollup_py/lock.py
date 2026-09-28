@@ -5,7 +5,7 @@ from __future__ import annotations
 import tomllib
 from collections import deque
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +15,7 @@ from packaging.utils import NormalizedName, canonicalize_name
 
 from rollup_py.config import TABLE, RollupConfig
 from rollup_py.errors import RollupError
+from rollup_py.markers import conflict_item, evaluate_extras
 
 LOCK_FILENAME = "uv.lock"
 LOCAL_SOURCES = frozenset({"editable", "virtual", "directory"})
@@ -53,6 +54,10 @@ class LockedPackage:
     wheels: list[dict[str, Any]]
     # Only recorded for local (workspace, path) packages.
     requires_dist: list[Requirement] | None
+    # Dependency groups (`[package.dev-dependencies]` and `[package.metadata.requires-dev]`).
+    dev_dependencies: dict[str, list[Dependency]] = field(default_factory=dict[str, list[Dependency]])
+    requires_dev: dict[str, list[Requirement]] = field(default_factory=dict[str, list[Requirement]])
+    provides_extras: frozenset[str] = frozenset()
 
     @property
     def key(self) -> tuple[str, str | None, tuple[tuple[str, str], ...]]:
@@ -82,6 +87,10 @@ class LockedPackage:
 class Lockfile:
     path: Path
     packages: list[LockedPackage]
+    # `[tool.uv] conflicts`: sets of `(package, "extra" | "group", name)` that cannot be enabled together.
+    conflicts: list[frozenset[tuple[str, str, str]]] = field(
+        default_factory=list[frozenset[tuple[str, str, str]]]
+    )
 
     @property
     def root(self) -> Path:
@@ -98,7 +107,18 @@ class Lockfile:
             raise RollupError(f"{path}: unsupported lockfile version {data.get('version')!r} (expected 1)")
 
         packages = [_parse_package(raw) for raw in data.get("package", [])]
-        return cls(path=path, packages=packages)
+        conflicts: list[frozenset[tuple[str, str, str]]] = [
+            frozenset(
+                (
+                    canonicalize_name(item["package"]),
+                    "extra" if "extra" in item else "group",
+                    canonicalize_name(item.get("extra") or item["group"]),
+                )
+                for item in conflict
+            )
+            for conflict in data.get("conflicts", [])
+        ]
+        return cls(path=path, packages=packages, conflicts=conflicts)
 
     def local_package(self, name: str) -> LockedPackage:
         normalized = canonicalize_name(name)
@@ -143,8 +163,15 @@ def find_lockfile(start: Path, configured: str | None) -> Path:
 def _parse_package(raw: Mapping[str, Any]) -> LockedPackage:
     metadata = raw.get("metadata")
     requires_dist = None
+    requires_dev: dict[str, list[Requirement]] = {}
+    provides_extras: frozenset[str] = frozenset()
     if metadata is not None:
         requires_dist = [_requirement_from_lock(entry) for entry in metadata.get("requires-dist", [])]
+        requires_dev = {
+            canonicalize_name(group): [_requirement_from_lock(entry) for entry in entries]
+            for group, entries in metadata.get("requires-dev", {}).items()
+        }
+        provides_extras = frozenset(canonicalize_name(extra) for extra in metadata.get("provides-extras", []))
     return LockedPackage(
         name=canonicalize_name(raw["name"]),
         version=raw.get("version"),
@@ -157,6 +184,12 @@ def _parse_package(raw: Mapping[str, Any]) -> LockedPackage:
         sdist=raw.get("sdist"),
         wheels=list(raw.get("wheels", [])),
         requires_dist=requires_dist,
+        dev_dependencies={
+            canonicalize_name(group): [Dependency.from_toml(dep) for dep in deps]
+            for group, deps in raw.get("dev-dependencies", {}).items()
+        },
+        requires_dev=requires_dev,
+        provides_extras=provides_extras,
     )
 
 
@@ -182,6 +215,8 @@ class Hoisted:
     dependency: Dependency
     # The parent's activated extras; they decide which of its requirements apply.
     parent_extras: frozenset[str]
+    # Dependency groups of the project whose requirements apply (only when the parent is the project).
+    parent_groups: frozenset[str] = frozenset()
 
 
 @dataclass(slots=True)
@@ -211,28 +246,51 @@ def plan_vendoring(
 ) -> VendorPlan:
     """Walk the lock graph from the project and split it into vendored and external packages.
 
-    Direct dependencies that are not vendored stay in the bundle's metadata as written. A walk
-    stops at every package that is not vendored: its own dependencies are the installer's job.
+    The walk starts at the project's dependencies plus those of the selected `extras` and
+    `groups`. Direct dependencies that are not vendored stay in the bundle's metadata as written
+    (those from selected extras and groups become unconditional requirements). A walk stops at
+    every package that is not vendored: its own dependencies are the installer's job.
     """
     project = lock.local_package(project_name)
     plan = VendorPlan(project=project)
+    active = _check_selection(lock, project, config)
 
-    direct_names = {dep.name for dep in project.dependencies}
+    # Dependencies of selected extras and groups are direct, but not in the bundle's metadata as is.
+    selected = [
+        *(dep for extra in sorted(config.extras) for dep in project.optional_dependencies.get(extra, ())),
+        *(dep for group in sorted(config.groups) for dep in project.dev_dependencies.get(group, ())),
+    ]
+
+    direct_names = {dep.name for dep in (*project.dependencies, *selected)}
     if config.vendor is not None and (unknown := config.vendor - direct_names):
         raise RollupError(
             f"`{TABLE}.vendor` lists packages that are not direct dependencies of `{project.name}`: "
             f"{', '.join(sorted(unknown))}"
         )
 
-    queue: deque[tuple[LockedPackage | None, frozenset[str], Dependency]] = deque()
+    def hoist_from_project(dep: Dependency) -> None:
+        plan.hoisted.append(Hoisted(project, dep, config.extras, config.groups))
+
+    # (parent, parent's extras, edge, whether the edge is a direct dependency of the project)
+    queue: deque[tuple[LockedPackage | None, frozenset[str], Dependency, bool]] = deque()
     for dep in project.dependencies:
         if config.vendor is None or dep.name in config.vendor:
-            queue.append((None, frozenset(), dep))
+            queue.append((None, frozenset(), dep, True))
+    for dep in selected:
+        if config.vendor is None or dep.name in config.vendor:
+            queue.append((project, config.extras, dep, True))
+        elif (dep := _select(dep, active)) is not None and _applies(dep, config, environment):
+            hoist_from_project(dep)
 
     while queue:
-        parent, parent_extras, dep = queue.popleft()
-        if not _should_vendor(dep, config, environment, direct=parent is None):
-            if parent is not None and _applies(dep, config, environment):
+        parent, parent_extras, lock_dep, direct = queue.popleft()
+        if (dep := _select(lock_dep, active)) is None:
+            continue
+        if not _should_vendor(dep, config, environment, direct=direct):
+            if parent is project:
+                if _applies(dep, config, environment):
+                    hoist_from_project(dep)
+            elif parent is not None and _applies(dep, config, environment):
                 plan.hoisted.append(Hoisted(parent, dep, parent_extras))
             continue
 
@@ -242,17 +300,53 @@ def plan_vendoring(
         if known is None:
             plan.vendored[package.key] = (package, requested)
             new_extras = requested
-            queue.extend((package, frozenset(requested), edge) for edge in package.edges())
+            queue.extend((package, frozenset(requested), edge, False) for edge in package.edges())
         else:
             new_extras = requested - known[1]
             known[1].update(new_extras)
         all_extras = frozenset(plan.vendored[package.key][1])
         for extra in sorted(new_extras):
-            queue.extend((package, all_extras, edge) for edge in package.optional_dependencies.get(extra, ()))
+            queue.extend(
+                (package, all_extras, edge, False) for edge in package.optional_dependencies.get(extra, ())
+            )
 
     _check_version_clashes(plan)
-    _check_external_overlap(lock, plan, config, environment)
+    _check_external_overlap(lock, plan, config, environment, active)
     return plan
+
+
+def _check_selection(lock: Lockfile, project: LockedPackage, config: RollupConfig) -> frozenset[str]:
+    """Validate `extras` and `groups`; return the conflict items (see `conflict_item`) they enable."""
+    for key, chosen, known in (
+        ("extras", config.extras, project.provides_extras | project.optional_dependencies.keys()),
+        ("groups", config.groups, project.requires_dev.keys() | project.dev_dependencies.keys()),
+    ):
+        if unknown := chosen - known:
+            raise RollupError(
+                f"`{TABLE}.{key}` lists names that `{project.name}` does not define: "
+                f"{', '.join(sorted(unknown))}"
+            )
+
+    enabled = {(project.name, "extra", extra) for extra in config.extras}
+    enabled |= {(project.name, "group", group) for group in config.groups}
+    for conflict in lock.conflicts:
+        if len(clash := conflict & enabled) > 1:
+            names = " and ".join(f"{kind} `{name}`" for _, kind, name in sorted(clash))
+            raise RollupError(f"`{TABLE}`: {names} conflict (`[tool.uv] conflicts`); select only one")
+    return frozenset(conflict_item(kind, package, name) for package, kind, name in enabled)
+
+
+def _select(dep: Dependency, active: frozenset[str]) -> Dependency | None:
+    """Settle the conflict clauses (`extra == 'extra-3-app-prod'`) of a lock edge for the selection.
+
+    Returns `None` when the edge belongs to an extra or group that is not selected.
+    """
+    if dep.marker is None or "extra" not in dep.marker:
+        return dep
+    result = evaluate_extras(Marker(dep.marker), active)
+    if result is False:
+        return None
+    return replace(dep, marker=None if result is True else str(result))
 
 
 def _should_vendor(
@@ -290,7 +384,11 @@ def _check_version_clashes(plan: VendorPlan) -> None:
 
 
 def _check_external_overlap(
-    lock: Lockfile, plan: VendorPlan, config: RollupConfig, environment: Mapping[str, str]
+    lock: Lockfile,
+    plan: VendorPlan,
+    config: RollupConfig,
+    environment: Mapping[str, str],
+    active: frozenset[str],
 ) -> None:
     """Fail if an installer would also install a vendored package as a separate distribution.
 
@@ -314,7 +412,9 @@ def _check_external_overlap(
     visited: set[tuple[str, str | None, tuple[tuple[str, str], ...], frozenset[str]]] = set()
     queue = deque(starts)
     while queue:
-        dep, path = queue.popleft()
+        lock_dep, path = queue.popleft()
+        if (dep := _select(lock_dep, active)) is None:
+            continue
         if (
             dep.marker is not None
             and config.conditional == "evaluate"
@@ -326,7 +426,9 @@ def _check_external_overlap(
         if state in visited:
             continue
         visited.add(state)
-        for edge in package.edges(dep.extras):
+        for lock_edge in package.edges(dep.extras):
+            if (edge := _select(lock_edge, active)) is None:
+                continue
             if edge.name in vendored:
                 raise RollupError(
                     f"`{edge.name}` is vendored but is also required by an external package "
