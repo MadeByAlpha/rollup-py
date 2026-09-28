@@ -85,6 +85,8 @@ def build_bundle(
     if not plan.vendored:
         log.warning("rollup: nothing to vendor; the bundle only differs from the standard wheel by its name")
     for extra, deps in sorted(plan.project.optional_dependencies.items()):
+        if extra in config.extras:
+            continue
         if shadowed := sorted({dep.name for dep in deps} & plan.vendored_names):
             log.warning(
                 f"rollup: extra `{extra}` requires vendored {', '.join(shadowed)}; "

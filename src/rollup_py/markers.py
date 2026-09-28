@@ -1,7 +1,8 @@
-"""Environment-marker helpers: splitting `extra` clauses off and building target environments."""
+"""Environment-marker helpers: settling `extra` clauses and building target environments."""
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import cast
 
 from packaging._parser import Node, Variable
@@ -48,6 +49,72 @@ def _strip(node: object, extras: set[str]) -> object | None:
             kept.append(items[index - 1])
         kept.append(operand)
     return kept or None
+
+
+def evaluate_extras(marker: Marker, active: Collection[str]) -> Marker | bool:
+    """Decide every `extra` comparison in `marker`, taking `active` as the set of enabled extras.
+
+    uv writes `[tool.uv] conflicts` into `uv.lock` as `extra == 'extra-3-app-prod'` style clauses
+    (see `conflict_item`). Unlike environment markers they are known when the bundle is built, so
+    they are settled here. Returns a bool when nothing else is left, else the remaining marker.
+    """
+    result = _reduce(marker._markers, frozenset(canonicalize_name(name) for name in active))
+    if isinstance(result, bool):
+        return result
+    return Marker(_format(result))
+
+
+def conflict_item(kind: str, package: str, name: str) -> str:
+    """The name uv gives an extra or dependency group in the conflict markers of `uv.lock`."""
+    package = canonicalize_name(package)
+    return f"{kind}-{len(package)}-{package}-{canonicalize_name(name)}"
+
+
+def _reduce(node: object, active: frozenset[str]) -> object:
+    if isinstance(node, tuple):
+        lhs, op, rhs = cast(tuple[Node, Node, Node], node)
+        if isinstance(lhs, Variable) and lhs.value == "extra":
+            value = rhs.value
+        elif isinstance(rhs, Variable) and rhs.value == "extra":
+            value = lhs.value
+        else:
+            return cast(object, node)
+        if op.value == "==":
+            return canonicalize_name(value) in active
+        if op.value == "!=":
+            return canonicalize_name(value) not in active
+        return cast(object, node)
+
+    # "and" binds tighter than "or": split into or-groups of and-ed operands, as packaging does.
+    items = cast(list[object], node)
+    groups: list[list[object]] = [[]]
+    for index in range(0, len(items), 2):
+        if index and items[index - 1] == "or":
+            groups.append([])
+        groups[-1].append(_reduce(items[index], active))
+
+    kept: list[object] = []
+    for group in groups:
+        if any(operand is False for operand in group):
+            continue
+        rest = [operand for operand in group if operand is not True]
+        if not rest:
+            return True
+        if kept:
+            kept.append("or")
+        kept.append(rest[0] if len(rest) == 1 else _join(rest, "and"))
+    if not kept:
+        return False
+    return kept[0] if len(kept) == 1 else kept
+
+
+def _join(operands: list[object], operator: str) -> list[object]:
+    joined: list[object] = []
+    for operand in operands:
+        if joined:
+            joined.append(operator)
+        joined.append(operand)
+    return joined
 
 
 def _format(node: object, *, top: bool = True) -> str:

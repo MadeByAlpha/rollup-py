@@ -5,7 +5,7 @@ from packaging.utils import canonicalize_name
 
 from rollup_py.config import RollupConfig
 from rollup_py.errors import RollupError
-from rollup_py.lock import Dependency, Hoisted, Lockfile, find_lockfile, plan_vendoring
+from rollup_py.lock import Dependency, Hoisted, Lockfile, VendorPlan, find_lockfile, plan_vendoring
 from rollup_py.markers import target_environment
 
 LINUX = target_environment("3.12", "x86_64-unknown-linux-gnu")
@@ -196,3 +196,130 @@ def test_find_lockfile_walks_up(tmp_path: Path) -> None:
     assert find_lockfile(nested, None) == tmp_path / "uv.lock"
     with pytest.raises(RollupError, match="does not exist"):
         find_lockfile(nested, "missing.lock")
+
+
+# A patched fork of `six` in the `prod` extra and the original in the `dev` group, as uv locks them.
+CONFLICT_LOCK = """\
+version = 1
+revision = 3
+requires-python = ">=3.12"
+conflicts = [[
+    { package = "app", extra = "prod" },
+    { package = "app", group = "dev" },
+]]
+
+[[package]]
+name = "app"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [{ name = "python-dateutil" }]
+
+[package.optional-dependencies]
+prod = [
+    { name = "six", version = "1.16.0", source = { git = "https://github.com/benjaminp/six?tag=1.16.0#65486e4" } },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "six", version = "1.17.0", source = { registry = "https://pypi.org/simple" } },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "python-dateutil" },
+    { name = "six", marker = "extra == 'prod'", git = "https://github.com/benjaminp/six?tag=1.16.0" },
+]
+provides-extras = ["prod", "docs"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "six", specifier = "==1.17.0" }]
+
+[[package]]
+name = "python-dateutil"
+version = "2.9.0.post0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "six", version = "1.16.0", source = { git = "https://github.com/benjaminp/six?tag=1.16.0#65486e4" }, marker = "extra == 'extra-3-app-prod'" },
+    { name = "six", version = "1.17.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'group-3-app-dev' or extra != 'extra-3-app-prod'" },
+]
+
+[[package]]
+name = "six"
+version = "1.16.0"
+source = { git = "https://github.com/benjaminp/six?tag=1.16.0#65486e4" }
+
+[[package]]
+name = "six"
+version = "1.17.0"
+source = { registry = "https://pypi.org/simple" }
+"""  # noqa: E501
+
+
+@pytest.fixture
+def conflict_lock(tmp_path: Path) -> Lockfile:
+    path = tmp_path / "uv.lock"
+    path.write_text(CONFLICT_LOCK)
+    return Lockfile.load(path)
+
+
+def vendored_versions(plan: VendorPlan) -> dict[str, str | None]:
+    return {package.name: package.version for package in plan.packages}
+
+
+@pytest.mark.parametrize(
+    ("options", "six"),
+    [
+        ({}, "1.17.0"),
+        ({"extras": ["prod"]}, "1.16.0"),
+        ({"groups": ["dev"]}, "1.17.0"),
+    ],
+)
+def test_selected_extra_or_group_picks_its_fork(
+    conflict_lock: Lockfile, options: dict[str, object], six: str
+) -> None:
+    plan = plan_vendoring(conflict_lock, "app", config(**options), LINUX)
+    assert vendored_versions(plan) == {"python-dateutil": "2.9.0.post0", "six": six}
+    assert plan.hoisted == []
+
+
+def test_selected_extra_that_is_external_becomes_a_requirement(conflict_lock: Lockfile) -> None:
+    plan = plan_vendoring(conflict_lock, "app", config(extras=["prod"], external=["six"]), LINUX)
+    assert vendored_versions(plan) == {"python-dateutil": "2.9.0.post0"}
+    project_items = [item for item in plan.hoisted if item.parent.name == "app"]
+    assert [(item.dependency.version, item.parent_extras) for item in project_items] == [("1.16.0", {"prod"})]
+    # Only the edge of the selected fork is left; its conflict marker is settled.
+    assert [(item.parent.name, item.dependency.version, item.dependency.marker) for item in plan.hoisted] == [
+        ("app", "1.16.0", None),
+        ("python-dateutil", "1.16.0", None),
+    ]
+
+
+def test_selected_group_outside_the_whitelist_becomes_a_requirement(conflict_lock: Lockfile) -> None:
+    plan = plan_vendoring(conflict_lock, "app", config(vendor=["python-dateutil"], groups=["dev"]), LINUX)
+    assert vendored_versions(plan) == {"python-dateutil": "2.9.0.post0", "six": "1.17.0"}
+    assert [(item.parent.name, item.parent_groups) for item in plan.hoisted] == [("app", {"dev"})]
+
+
+def test_whitelist_accepts_dependencies_of_selected_extras(conflict_lock: Lockfile) -> None:
+    # `six` is accepted as a direct dependency, but the external `python-dateutil` still needs it.
+    with pytest.raises(RollupError, match=r"`six` is vendored.*app -> python-dateutil -> six"):
+        plan_vendoring(conflict_lock, "app", config(vendor=["six"], extras=["prod"]), LINUX)
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"extras": ["nope"]}, "`app` does not define: nope"),
+        ({"groups": ["prod"]}, "`app` does not define: prod"),
+        ({"extras": ["prod"], "groups": ["dev"]}, "extra `prod` and group `dev` conflict"),
+    ],
+)
+def test_invalid_selection(conflict_lock: Lockfile, options: dict[str, object], message: str) -> None:
+    with pytest.raises(RollupError, match=message):
+        plan_vendoring(conflict_lock, "app", config(**options), LINUX)
+
+
+def test_extra_without_dependencies_can_be_selected(conflict_lock: Lockfile) -> None:
+    # `docs` is only listed in `provides-extras`.
+    plan = plan_vendoring(conflict_lock, "app", config(extras=["docs"]), LINUX)
+    assert vendored_versions(plan)["six"] == "1.17.0"

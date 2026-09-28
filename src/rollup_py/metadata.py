@@ -63,6 +63,10 @@ def hoisted_requirements(hoisted: Iterable[Hoisted], dists: dict[str, InstalledD
         declared = (
             parent.requires_dist if parent.requires_dist is not None else (dist.requires_dist if dist else [])
         )
+        declared = [
+            *declared,
+            *(req for group in sorted(item.parent_groups) for req in parent.requires_dev.get(group, ())),
+        ]
         matches = [req for req in declared if canonicalize_name(req.name) == item.dependency.name]
 
         rendered: list[str] = []
